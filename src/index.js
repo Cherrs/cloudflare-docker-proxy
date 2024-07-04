@@ -14,6 +14,7 @@ const routes = {
   "k8s.devppm.com": "https://registry.k8s.io",
   "ghcr.devppm.com": "https://ghcr.io",
   "cloudsmith.devppm.com": "https://docker.cloudsmith.io",
+  "ecr.devppm.com": "https://public.ecr.aws",
 
   // staging
   "docker-staging.devppm.com": dockerHub,
