@@ -20,77 +20,54 @@ const routes = {
   "docker-staging.devppm.com": dockerHub,
 };
 
-async function handleRequest(request) {
-  const handler = new RequestHandler(request)
-  return handler.start()
+function routeByHosts(host) {
+  if (host in routes) {
+    return routes[host];
+  }
+  if (MODE == "debug") {
+    return TARGET_UPSTREAM;
+  }
+  return "";
 }
 
-const AUTHORIZE_PATH = "/v2/auth";
-
-class RequestHandler {
-  request;
-  url;
-  upstream;
-  constructor(request) {
-    this.request = request;
-    this.url = new URL(request.url)
-    this.upstream = getUpstream(this.url.hostname)
-    if (!this.upstream) {
-      throw new Error('未找到映射的 upstream 配置项')
-    }
-  }
-
-  get isDockerHub() {
-    this.upstream === DOCKER_HUB;
-  }
-
-  start() {
-    if (this.url.pathname === AUTHORIZE_PATH) {
-      return this.authorize()
-    }
-    // 处理默认的 library 命名空间
-    // Example: /v2/busybox/manifests/latest => /v2/library/busybox/manifests/latest
-    if (this.isDockerHub) {
-      const pathParts = url.pathname.split("/");
-      if (pathParts.length == 5) {
-        pathParts.splice(2, 0, "library");
-        const redirectUrl = new URL(url);
-        redirectUrl.pathname = pathParts.join("/");
-        return Response.redirect(redirectUrl, 301);
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const upstream = routeByHosts(url.hostname);
+  if (upstream === "") {
+    return new Response(
+      JSON.stringify({
+        routes: routes,
+      }),
+      {
+        status: 404,
       }
-    }
-    // 代理原始请求
-    return this.forwardRequest()
+    );
   }
-
-  async forwardRequest() {
-    const newUrl = new URL(this.upstream + this.url.pathname);
-    const newReq = new Request(newUrl, {
-      method: this.request.method,
-      headers: this.request.headers,
+  const isDockerHub = upstream == dockerHub;
+  const authorization = request.headers.get("Authorization");
+  if (url.pathname == "/v2/") {
+    const newUrl = new URL(upstream + "/v2/");
+    const headers = new Headers();
+    if (authorization) {
+      headers.set("Authorization", authorization);
+    }
+    // check if need to authenticate
+    const resp = await fetch(newUrl.toString(), {
+      method: "GET",
+      headers: headers,
       redirect: "follow",
     });
-    const resp = await fetch(newReq);
     if (resp.status === 401) {
-      const newResp = new Response(resp.body, resp);
-      newResp.headers.set(
-        "Www-Authenticate",
-        `Bearer realm="${this.url.protocol}//${this.url.host}${AUTHORIZE_PATH}",service="cloudflare-docker-proxy"`
-      );
-      return newResp;
+      return responseUnauthorized(url);
     }
     return resp;
   }
-
-  async authorize() {
-    const authorization = this.request.headers.get("Authorization");
-    const newUrl = new URL(this.upstream + "/v2/");
-    const resp = await fetch(newUrl, {
+  // get token
+  if (url.pathname == "/v2/auth") {
+    const newUrl = new URL(upstream + "/v2/");
+    const resp = await fetch(newUrl.toString(), {
       method: "GET",
       redirect: "follow",
-      headers: {
-        Authorization: authorization
-      }
     });
     if (resp.status !== 401) {
       return resp;
@@ -100,21 +77,41 @@ class RequestHandler {
       return resp;
     }
     const wwwAuthenticate = parseAuthenticate(authenticateStr);
-    const scope = this.url.searchParams.get("scope");
+    let scope = url.searchParams.get("scope");
     // autocomplete repo part into scope for DockerHub library images
     // Example: repository:busybox:pull => repository:library/busybox:pull
-    return fetchToken(wwwAuthenticate, scope, authorization);
+    if (scope && isDockerHub) {
+      let scopeParts = scope.split(":");
+      if (scopeParts.length == 3 && !scopeParts[1].includes("/")) {
+        scopeParts[1] = "library/" + scopeParts[1];
+        scope = scopeParts.join(":");
+      }
+    }
+    return await fetchToken(wwwAuthenticate, scope, authorization);
   }
-}
-
-function getUpstream(host) {
-  if (host in routes) {
-    return routes[host];
+  // redirect for DockerHub library images
+  // Example: /v2/busybox/manifests/latest => /v2/library/busybox/manifests/latest
+  if (isDockerHub) {
+    const pathParts = url.pathname.split("/");
+    if (pathParts.length == 5) {
+      pathParts.splice(2, 0, "library");
+      const redirectUrl = new URL(url);
+      redirectUrl.pathname = pathParts.join("/");
+      return Response.redirect(redirectUrl, 301);
+    }
   }
-  if (MODE == "debug") {
-    return TARGET_UPSTREAM;
+  // foward requests
+  const newUrl = new URL(upstream + url.pathname);
+  const newReq = new Request(newUrl, {
+    method: request.method,
+    headers: request.headers,
+    redirect: "follow",
+  });
+  const resp = await fetch(newReq);
+  if (resp.status == 401) {
+    return responseUnauthorized(url);
   }
-  return "";
+  return resp;
 }
 
 function parseAuthenticate(authenticateStr) {
@@ -144,4 +141,23 @@ async function fetchToken(wwwAuthenticate, scope, authorization) {
     headers.set("Authorization", authorization);
   }
   return await fetch(url, { method: "GET", headers: headers });
+}
+
+function responseUnauthorized(url) {
+  const headers = new(Headers);
+  if (MODE == "debug") {
+    headers.set(
+      "Www-Authenticate",
+      `Bearer realm="http://${url.host}/v2/auth",service="cloudflare-docker-proxy"`
+    );
+  } else {
+    headers.set(
+      "Www-Authenticate",
+      `Bearer realm="https://${url.hostname}/v2/auth",service="cloudflare-docker-proxy"`
+    );
+  }
+  return new Response(JSON.stringify({ message: "UNAUTHORIZED" }), {
+    status: 401,
+    headers: headers,
+  });
 }
